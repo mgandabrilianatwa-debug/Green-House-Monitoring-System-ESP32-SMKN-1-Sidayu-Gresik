@@ -1,0 +1,721 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <ArduinoJson.h>
+
+// WiFi Configuration
+const char* ssid = "Greenhouse ioT Esp32";
+const char* password = "00000000";
+
+// Pin Definitions
+#define DHT_PIN 15
+#define LDR_PIN 34
+#define RELAY1_PIN 4
+#define RELAY2_PIN 16
+#define RELAY3_PIN 17
+#define RELAY4_PIN 18
+#define RELAY5_PIN 19
+
+// DHT Sensor
+#define DHTTYPE DHT11
+DHT dht(DHT_PIN, DHTTYPE);
+
+// Web Server
+WebServer server(80);
+
+// System Variables
+bool isAutoMode = true;
+bool relayStates[5] = { false, false, true, false, false };
+
+// Threshold Settings
+struct Settings {
+  float tempMin = 29.0;
+  float tempMax = 32.0;
+  float humidMin = 40.0;
+  float humidMax = 60.0;
+  int lightThresh = 500;
+} settings;
+
+// Sensor Data
+struct SensorData {
+  float temperature = 0;
+  float humidity = 0;
+  int lightLevel = 0;
+} sensorData;
+
+// Anti-flicker variables
+unsigned long lastRelayChange[5] = { 0, 0, 0, 0, 0 };
+const unsigned long RELAY_DELAY = 1000;
+bool prevCondition[3] = { false, false, false };
+
+// Moving average for LDR
+const int LDR_SAMPLES = 10;
+int ldrReadings[LDR_SAMPLES];
+int ldrIndex = 0;
+int ldrTotal = 0;
+
+// Anti-trigger for LDR (debounce and hysteresis)
+unsigned long lastLDRChange = 0;
+const unsigned long LDR_DEBOUNCE_DELAY = 3000;  // 3 seconds delay
+int lastStableLightLevel = 0;
+const int LDR_HYSTERESIS = 100;  // Hysteresis range
+
+// HTML Page - Split into parts to avoid compilation issues
+const char HTML_PART1[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Greenhouse Monitor - SMKN 1 Sidayu</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',sans-serif;background:linear-gradient(-45deg,#1a1a2e,#16213e,#0f3460,#1a1a2e);
+background-size:400% 400%;animation:bg 15s ease infinite;min-height:100vh;padding:20px;color:#fff}
+@keyframes bg{0%,100%{background-position:0 50%}50%{background-position:100% 50%}}
+.container{max-width:1400px;margin:0 auto}
+.school-header{text-align:center;margin-bottom:25px;padding:25px;background:rgba(255,255,255,.08);
+border-radius:20px;border:2px solid rgba(102,126,234,.3);backdrop-filter:blur(10px)}
+.school-logo{font-size:3.5em;margin-bottom:10px;text-shadow:0 0 20px rgba(102,126,234,.8)}
+.school-name{font-size:1.8em;font-weight:900;background:linear-gradient(135deg,#667eea,#764ba2,#f093fb);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:8px;letter-spacing:2px}
+.school-program{font-size:1em;color:rgba(255,255,255,.85);font-weight:600;letter-spacing:1px;
+line-height:1.5;margin-top:8px;padding:8px 15px;background:rgba(102,126,234,.15);border-radius:10px;
+display:inline-block}
+.school-major{color:#ffd700;font-weight:700}
+.header{text-align:center;margin-bottom:30px}
+.header h1{font-size:2.5em;margin-bottom:10px;background:linear-gradient(135deg,#667eea,#764ba2);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.tabs{display:flex;gap:10px;margin-bottom:20px;background:rgba(255,255,255,.05);padding:10px;border-radius:15px}
+.tab-btn{flex:1;padding:12px;border:none;border-radius:10px;cursor:pointer;font-size:16px;font-weight:bold;
+background:rgba(255,255,255,.05);color:rgba(255,255,255,.6);transition:all .3s}
+.tab-btn.active{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff}
+.tab-content{display:none}
+.tab-content.active{display:block}
+.mode-toggle{background:rgba(255,255,255,.05);padding:15px;border-radius:15px;margin-bottom:20px;text-align:center}
+.mode-toggle button{padding:12px 30px;border:none;border-radius:25px;cursor:pointer;font-weight:bold;
+margin:0 5px;transition:all .3s}
+.mode-toggle button.active{background:linear-gradient(135deg,#4CAF50,#45a049);color:#fff}
+.mode-toggle button:not(.active){background:rgba(255,255,255,.1);color:rgba(255,255,255,.6)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px;margin-bottom:20px}
+.card{background:rgba(255,255,255,.05);padding:25px;border-radius:20px;border:1px solid rgba(255,255,255,.1)}
+.card h2{margin-bottom:15px;font-size:1.3em;border-bottom:2px solid rgba(102,126,234,.5);padding-bottom:10px}
+.sensor-value{font-size:3em;font-weight:900;margin:15px 0}
+.sensor-unit{font-size:.4em;color:rgba(255,255,255,.7);margin-left:5px}
+.sensor-label{color:rgba(255,255,255,.7);font-size:.9em}
+.status-indicator{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:8px}
+.status-on{background:#4CAF50;box-shadow:0 0 10px #4CAF50}
+.status-off{background:rgba(255,255,255,.2)}
+.relay-control{display:flex;justify-content:space-between;align-items:center;padding:15px;
+background:rgba(255,255,255,.03);border-radius:10px;margin-bottom:10px}
+.relay-name{font-weight:bold}
+.toggle-btn{padding:10px 25px;border:none;border-radius:25px;cursor:pointer;font-weight:bold;
+transition:all .3s;min-width:80px}
+.toggle-btn.on{background:linear-gradient(135deg,#4CAF50,#45a049);color:#fff}
+.toggle-btn.off{background:linear-gradient(135deg,#f44336,#d32f2f);color:#fff}
+.toggle-btn:disabled{background:rgba(255,255,255,.1);opacity:.4;cursor:not-allowed}
+.plant-presets{background:rgba(255,255,255,.05);padding:20px;border-radius:15px;margin-bottom:20px}
+.plant-presets h3{margin-bottom:15px;font-size:1.2em;text-align:center}
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px}
+.preset-btn{padding:15px 10px;border:2px solid rgba(255,255,255,.2);border-radius:12px;cursor:pointer;
+background:rgba(255,255,255,.05);color:#fff;transition:all .3s;text-align:center;font-weight:bold}
+.preset-btn:hover{background:rgba(255,255,255,.1);transform:translateY(-2px);border-color:rgba(102,126,234,.5)}
+.preset-btn.active{background:linear-gradient(135deg,#667eea,#764ba2);border-color:#667eea}
+.preset-icon{font-size:2em;display:block;margin-bottom:5px}
+.preset-name{font-size:0.9em}
+.setting-group{background:rgba(255,255,255,.03);padding:20px;border-radius:10px;margin-bottom:15px}
+.setting-group h3{margin-bottom:15px;font-size:1.2em}
+.setting-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
+.setting-row input{width:100px;padding:10px;border:2px solid rgba(255,255,255,.2);border-radius:8px;
+background:rgba(255,255,255,.05);color:#fff;text-align:center;font-size:16px}
+.save-btn{width:100%;padding:15px;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;
+border:none;border-radius:25px;font-size:18px;font-weight:bold;cursor:pointer;transition:all .3s}
+.save-btn:hover{transform:translateY(-2px);box-shadow:0 10px 25px rgba(102,126,234,.5)}
+.notification{position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#4CAF50,#45a049);
+padding:15px 25px;border-radius:10px;display:none;z-index:1000}
+.info-box,.warning-box{padding:15px;border-radius:8px;margin:15px 0;line-height:1.6}
+.info-box{background:rgba(33,150,243,.1);border-left:4px solid #2196F3}
+.warning-box{background:rgba(255,193,7,.1);border-left:4px solid #ffc107}
+.footer{text-align:center;margin-top:30px;padding:20px;background:rgba(255,255,255,.05);border-radius:15px;
+color:rgba(255,255,255,.7);font-size:0.9em}
+@media(max-width:768px){.school-name{font-size:1.3em}.school-program{font-size:0.85em}.header h1{font-size:2em}
+.grid{grid-template-columns:1fr}.sensor-value{font-size:2em}.preset-grid{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="school-header">
+<div class="school-logo">🎓</div>
+<div class="school-name">SMKN 1 SIDAYU GRESIK</div>
+<div class="school-program">Program Konsentrasi Keahlian Jurusan<br><span class="school-major">TEKNIK INSTALASI TENAGA LISTRIK</span></div>
+</div>
+<div class="header">
+<h1>🌱 GREENHOUSE MONITORING</h1>
+<p>⚡ ESP32 Real-time Dashboard ⚡</p>
+</div>
+<div class="tabs">
+<button class="tab-btn active" onclick="switchTab('dashboard',event)">📊 Dashboard</button>
+<button class="tab-btn" onclick="switchTab('settings',event)">⚙️ Settings</button>
+</div>
+<div id="dashboard" class="tab-content active">
+<div class="mode-toggle">
+<button id="autoBtn" class="active" onclick="setMode('auto')">🤖 AUTO MODE</button>
+<button id="manualBtn" onclick="setMode('manual')">👆 MANUAL MODE</button>
+</div>
+<div class="grid">
+<div class="card">
+<h2>🌡️ Temperature</h2>
+<div class="sensor-value" id="temp">--<span class="sensor-unit">°C</span></div>
+<div class="sensor-label" id="tempRange">Max: 32°C | Min: 29°C</div>
+</div>
+<div class="card">
+<h2>💧 Humidity</h2>
+<div class="sensor-value" id="humid">--<span class="sensor-unit">%</span></div>
+<div class="sensor-label" id="humidRange">Max: 60% | Min: 40%</div>
+</div>
+<div class="card">
+<h2>☀️ Light Level</h2>
+<div class="sensor-value" id="light">--</div>
+<div class="sensor-label" id="lightRange">Threshold: 500</div>
+</div>
+</div>
+<div class="card">
+<h2>🎛️ Relay Control</h2>
+<div class="relay-control">
+<div><span class="status-indicator status-off" id="status1"></span>
+<span class="relay-name">💦 Pompa Air</span></div>
+<button class="toggle-btn off" id="btn1" onclick="toggleRelay(1)">OFF</button>
+</div>
+<div class="relay-control">
+<div><span class="status-indicator status-off" id="status2"></span>
+<span class="relay-name">🌀 Kipas</span></div>
+<button class="toggle-btn off" id="btn2" onclick="toggleRelay(2)">OFF</button>
+</div>
+<div class="relay-control">
+<div><span class="status-indicator status-on" id="status3"></span>
+<span class="relay-name">💡 Lampu</span></div>
+<button class="toggle-btn on" id="btn3" onclick="toggleRelay(3)">ON</button>
+</div>
+<div class="relay-control">
+<div><span class="status-indicator status-off" id="status4"></span>
+<span class="relay-name">⚡ Cadangan 1</span></div>
+<button class="toggle-btn off" id="btn4" onclick="toggleRelay(4)">OFF</button>
+</div>
+<div class="relay-control">
+<div><span class="status-indicator status-off" id="status5"></span>
+<span class="relay-name">🔌 Cadangan 2</span></div>
+<button class="toggle-btn off" id="btn5" onclick="toggleRelay(5)">OFF</button>
+</div>
+</div>
+</div>
+)rawliteral";
+
+const char HTML_PART2[] PROGMEM = R"rawliteral(
+<div id="settings" class="tab-content">
+<div class="card">
+<h2>🌿 Preset Tanaman</h2>
+<div class="plant-presets">
+<h3>Pilih Jenis Tanaman:</h3>
+<div class="preset-grid">
+<button class="preset-btn" onclick="applyPreset('sawi')">
+<span class="preset-icon">🥬</span>
+<span class="preset-name">Sawi</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('brokoli')">
+<span class="preset-icon">🥦</span>
+<span class="preset-name">Brokoli</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('selada')">
+<span class="preset-icon">🥗</span>
+<span class="preset-name">Selada</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('melon')">
+<span class="preset-icon">🍈</span>
+<span class="preset-name">Melon</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('semangka')">
+<span class="preset-icon">🍉</span>
+<span class="preset-name">Semangka</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('timun')">
+<span class="preset-icon">🥒</span>
+<span class="preset-name">Timun</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('cabai')">
+<span class="preset-icon">🌶️</span>
+<span class="preset-name">Cabai</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('anggur')">
+<span class="preset-icon">🍇</span>
+<span class="preset-name">Anggur</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('apel')">
+<span class="preset-icon">🍎</span>
+<span class="preset-name">Apel</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('mangga')">
+<span class="preset-icon">🥭</span>
+<span class="preset-name">Mangga</span>
+</button>
+<button class="preset-btn" onclick="applyPreset('pear')">
+<span class="preset-icon">🍐</span>
+<span class="preset-name">Pear</span>
+</button>
+</div>
+</div>
+<div class="info-box">
+<strong>💡 Info Preset:</strong><br>
+• <strong>Sawi:</strong> Temp 20-25°C, Humid 60-80%<br>
+• <strong>Brokoli:</strong> Temp 18-23°C, Humid 65-80%<br>
+• <strong>Selada:</strong> Temp 15-20°C, Humid 60-75%<br>
+• <strong>Melon:</strong> Temp 25-30°C, Humid 60-70%<br>
+• <strong>Semangka:</strong> Temp 25-32°C, Humid 60-75%<br>
+• <strong>Timun:</strong> Temp 24-29°C, Humid 65-80%<br>
+• <strong>Cabai:</strong> Temp 25-30°C, Humid 60-80%<br>
+• <strong>Anggur:</strong> Temp 15-25°C, Humid 50-70%<br>
+• <strong>Apel:</strong> Temp 18-24°C, Humid 60-75%<br>
+• <strong>Mangga:</strong> Temp 24-30°C, Humid 50-70%<br>
+• <strong>Pear:</strong> Temp 18-24°C, Humid 60-75%
+</div>
+</div>
+<div class="card">
+<h2>⚙️ Pengaturan Manual</h2>
+<div class="warning-box">
+<strong>⚠️ Anti-Kedip Aktif:</strong> Sistem menggunakan hysteresis dan delay untuk mencegah trigger berulang.<br>
+• Relay: Delay 1 detik antar perubahan<br>
+• LDR Sensor: Delay 3 detik + Hysteresis ±100 untuk stabilitas maksimal
+</div>
+<div class="setting-group">
+<h3>🌡️ Suhu (Temperature)</h3>
+<div class="setting-row">
+<label>Suhu Minimum:</label>
+<input type="number" id="tempMin" step="0.5" value="29"> <span>°C</span>
+</div>
+<div class="setting-row">
+<label>Suhu Maximum:</label>
+<input type="number" id="tempMax" step="0.5" value="32"> <span>°C</span>
+</div>
+</div>
+<div class="setting-group">
+<h3>💧 Kelembapan (Humidity)</h3>
+<div class="setting-row">
+<label>Kelembapan Minimum:</label>
+<input type="number" id="humidMin" step="1" value="40"> <span>%</span>
+</div>
+<div class="setting-row">
+<label>Kelembapan Maximum:</label>
+<input type="number" id="humidMax" step="1" value="60"> <span>%</span>
+</div>
+</div>
+<div class="setting-group">
+<h3>☀️ Intensitas Cahaya (Light)</h3>
+<div class="setting-row">
+<label>Threshold Cahaya:</label>
+<input type="number" id="lightThresh" step="50" value="500">
+</div>
+</div>
+<button class="save-btn" onclick="saveSettings()">💾 Simpan Pengaturan</button>
+<div class="info-box">
+<strong>💡 Fitur Sistem:</strong><br>
+• Moving Average 10 sampel untuk sensor LDR<br>
+• Hysteresis ±100 untuk anti-trigger LDR<br>
+• Debounce 3 detik pada pembacaan LDR<br>
+• Delay 1 detik antar perubahan relay<br>
+• Hysteresis mencegah oscillation relay
+</div>
+</div>
+</div>
+<div class="footer">
+<strong>Greenhouse Monitoring System</strong><br>
+Dikembangkan oleh Siswa SMKN 1 Sidayu Gresik<br>
+© 2025 - Teknik Instalasi Tenaga Listrik
+</div>
+</div>
+<div id="notification" class="notification">✅ Pengaturan berhasil disimpan!</div>
+<script>
+let isAutoMode=true;
+const plantPresets={
+sawi:{tempMin:20,tempMax:25,humidMin:60,humidMax:80,lightThresh:400},
+brokoli:{tempMin:18,tempMax:23,humidMin:65,humidMax:80,lightThresh:450},
+selada:{tempMin:15,tempMax:20,humidMin:60,humidMax:75,lightThresh:350},
+melon:{tempMin:25,tempMax:30,humidMin:60,humidMax:70,lightThresh:600},
+semangka:{tempMin:25,tempMax:32,humidMin:60,humidMax:75,lightThresh:650},
+timun:{tempMin:24,tempMax:29,humidMin:65,humidMax:80,lightThresh:550},
+cabai:{tempMin:25,tempMax:30,humidMin:60,humidMax:80,lightThresh:500},
+anggur:{tempMin:15,tempMax:25,humidMin:50,humidMax:70,lightThresh:600},
+apel:{tempMin:18,tempMax:24,humidMin:60,humidMax:75,lightThresh:550},
+mangga:{tempMin:24,tempMax:30,humidMin:50,humidMax:70,lightThresh:650},
+pear:{tempMin:18,tempMax:24,humidMin:60,humidMax:75,lightThresh:500}
+};
+function switchTab(tab,e){
+document.querySelectorAll('.tab-content').forEach(el=>el.classList.remove('active'));
+document.querySelectorAll('.tab-btn').forEach(el=>el.classList.remove('active'));
+document.getElementById(tab).classList.add('active');
+e.target.classList.add('active');
+if(tab==='settings')loadSettings();
+}
+function applyPreset(plant){
+const preset=plantPresets[plant];
+if(preset){
+document.getElementById('tempMin').value=preset.tempMin;
+document.getElementById('tempMax').value=preset.tempMax;
+document.getElementById('humidMin').value=preset.humidMin;
+document.getElementById('humidMax').value=preset.humidMax;
+document.getElementById('lightThresh').value=preset.lightThresh;
+document.querySelectorAll('.preset-btn').forEach(btn=>btn.classList.remove('active'));
+event.currentTarget.classList.add('active');
+}
+}
+function updateData(){
+fetch('/api/data').then(r=>r.json()).then(data=>{
+document.getElementById('temp').innerHTML=data.temperature.toFixed(1)+'<span class="sensor-unit">°C</span>';
+document.getElementById('humid').innerHTML=data.humidity.toFixed(1)+'<span class="sensor-unit">%</span>';
+document.getElementById('light').innerHTML=data.lightLevel;
+for(let i=1;i<=5;i++)updateRelayStatus(i,data.relays[i-1]);
+isAutoMode=data.isAutoMode;
+updateModeButtons();
+}).catch(err=>console.error(err));
+}
+function updateRelayStatus(relay,state){
+const s=document.getElementById('status'+relay);
+const b=document.getElementById('btn'+relay);
+if(!s||!b)return;
+if(state){
+s.className='status-indicator status-on';
+b.innerHTML='ON';
+b.className='toggle-btn on';
+}else{
+s.className='status-indicator status-off';
+b.innerHTML='OFF';
+b.className='toggle-btn off';
+}
+if(isAutoMode&&relay<=3)b.disabled=true;
+else b.disabled=false;
+}
+function toggleRelay(relay){
+fetch('/api/relay?id='+relay+'&action=toggle',{method:'POST'})
+.then(r=>r.json()).then(data=>updateRelayStatus(relay,data.state))
+.catch(err=>console.error(err));
+}
+function setMode(mode){
+fetch('/api/mode?mode='+mode,{method:'POST'})
+.then(r=>r.json()).then(data=>{
+isAutoMode=data.isAutoMode;
+updateModeButtons();
+updateData();
+}).catch(err=>console.error(err));
+}
+function updateModeButtons(){
+const a=document.getElementById('autoBtn');
+const m=document.getElementById('manualBtn');
+if(isAutoMode){a.className='active';m.className='';}
+else{a.className='';m.className='active';}
+}
+function loadSettings(){
+fetch('/api/settings').then(r=>r.json()).then(data=>{
+document.getElementById('tempMin').value=data.tempMin;
+document.getElementById('tempMax').value=data.tempMax;
+document.getElementById('humidMin').value=data.humidMin;
+document.getElementById('humidMax').value=data.humidMax;
+document.getElementById('lightThresh').value=data.lightThresh;
+}).catch(err=>console.error(err));
+}
+function saveSettings(){
+const s={
+tempMin:parseFloat(document.getElementById('tempMin').value),
+tempMax:parseFloat(document.getElementById('tempMax').value),
+humidMin:parseFloat(document.getElementById('humidMin').value),
+humidMax:parseFloat(document.getElementById('humidMax').value),
+lightThresh:parseInt(document.getElementById('lightThresh').value)
+};
+if(s.tempMin>=s.tempMax){alert('Suhu min harus < max!');return;}
+if(s.humidMin>=s.humidMax){alert('Kelembapan min harus < max!');return;}
+fetch('/api/settings',{
+method:'POST',
+headers:{'Content-Type':'application/json'},
+body:JSON.stringify(s)
+}).then(r=>r.json()).then(data=>{
+document.getElementById('tempRange').textContent='Max: '+s.tempMax+'°C | Min: '+s.tempMin+'°C';
+document.getElementById('humidRange').textContent='Max: '+s.humidMax+'% | Min: '+s.humidMin+'%';
+document.getElementById('lightRange').textContent='Threshold: '+s.lightThresh;
+showNotification();
+}).catch(err=>console.error(err));
+}
+function showNotification(){
+const n=document.getElementById('notification');
+n.style.display='block';
+setTimeout(()=>n.style.display='none',3000);
+}
+setInterval(updateData,2000);
+updateData();
+</script>
+</body>
+</html>
+)rawliteral";
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize relay pins
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(RELAY3_PIN, OUTPUT);
+  pinMode(RELAY4_PIN, OUTPUT);
+  pinMode(RELAY5_PIN, OUTPUT);
+
+  // Set initial relay states (active HIGH)
+  digitalWrite(RELAY1_PIN, LOW);   // OFF
+  digitalWrite(RELAY2_PIN, LOW);   // OFF
+  digitalWrite(RELAY3_PIN, HIGH);  // ON (Lampu default ON)
+  digitalWrite(RELAY4_PIN, LOW);   // OFF
+  digitalWrite(RELAY5_PIN, LOW);   // OFF
+
+  // Initialize DHT sensor
+  dht.begin();
+
+  // Initialize LDR moving average
+  for (int i = 0; i < LDR_SAMPLES; i++) {
+    ldrReadings[i] = 0;
+  }
+  
+  // Initialize stable LDR value
+  lastStableLightLevel = analogRead(LDR_PIN);
+
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Setup web server routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/data", HTTP_GET, handleGetData);
+  server.on("/api/relay", HTTP_POST, handleRelayControl);
+  server.on("/api/mode", HTTP_POST, handleModeChange);
+  server.on("/api/settings", HTTP_GET, handleGetSettings);
+  server.on("/api/settings", HTTP_POST, handleSaveSettings);
+
+  server.begin();
+  Serial.println("Web server started");
+}
+
+void loop() {
+  server.handleClient();
+  readSensors();
+  if (isAutoMode) {
+    autoControl();
+  }
+  delay(100);
+}
+
+void readSensors() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h) && !isnan(t)) {
+    sensorData.temperature = t;
+    sensorData.humidity = h;
+  }
+
+  // Moving average for LDR to reduce noise
+  ldrTotal = ldrTotal - ldrReadings[ldrIndex];
+  ldrReadings[ldrIndex] = analogRead(LDR_PIN);
+  ldrTotal = ldrTotal + ldrReadings[ldrIndex];
+  ldrIndex = (ldrIndex + 1) % LDR_SAMPLES;
+  
+  int averageLDR = ldrTotal / LDR_SAMPLES;
+  
+  // Anti-trigger: Only update if value changed significantly and enough time passed
+  unsigned long currentTime = millis();
+  if (currentTime - lastLDRChange >= LDR_DEBOUNCE_DELAY) {
+    // Check if light level changed beyond hysteresis range
+    if (abs(averageLDR - lastStableLightLevel) > LDR_HYSTERESIS) {
+      lastStableLightLevel = averageLDR;
+      lastLDRChange = currentTime;
+    }
+  }
+  
+  sensorData.lightLevel = lastStableLightLevel;
+}
+
+void autoControl() {
+  unsigned long currentTime = millis();
+
+  // Relay 1 (Pompa Air) - Humidity control
+  if (currentTime - lastRelayChange[0] >= RELAY_DELAY) {
+    bool shouldTurnOn = sensorData.humidity < settings.humidMin - 2;
+    bool shouldTurnOff = sensorData.humidity > settings.humidMax;
+
+    if (shouldTurnOn && !relayStates[0]) {
+      setRelay(1, true);
+      lastRelayChange[0] = currentTime;
+    } else if (shouldTurnOff && relayStates[0]) {
+      setRelay(1, false);
+      lastRelayChange[0] = currentTime;
+    }
+  }
+
+  // Relay 2 (Kipas) - Temperature control
+  if (currentTime - lastRelayChange[1] >= RELAY_DELAY) {
+    bool shouldTurnOn = sensorData.temperature > settings.tempMax;
+    bool shouldTurnOff = sensorData.temperature < settings.tempMin + 1;
+
+    if (shouldTurnOn && !relayStates[1]) {
+      setRelay(2, true);
+      lastRelayChange[1] = currentTime;
+    } else if (shouldTurnOff && relayStates[1]) {
+      setRelay(2, false);
+      lastRelayChange[1] = currentTime;
+    }
+  }
+
+  // Relay 3 (Lampu) - Light level control with anti-trigger
+  if (currentTime - lastRelayChange[2] >= RELAY_DELAY) {
+    // Use wider hysteresis for relay control to prevent flickering
+    bool shouldTurnOn = sensorData.lightLevel < (settings.lightThresh - 100);
+    bool shouldTurnOff = sensorData.lightLevel > (settings.lightThresh + 100);
+
+    if (shouldTurnOn && !relayStates[2]) {
+      setRelay(3, true);
+      lastRelayChange[2] = currentTime;
+    } else if (shouldTurnOff && relayStates[2]) {
+      setRelay(3, false);
+      lastRelayChange[2] = currentTime;
+    }
+  }
+}
+
+void setRelay(int relayNum, bool state) {
+  relayStates[relayNum - 1] = state;
+  int pin = 0;
+
+  switch (relayNum) {
+    case 1: pin = RELAY1_PIN; break;
+    case 2: pin = RELAY2_PIN; break;
+    case 3: pin = RELAY3_PIN; break;
+    case 4: pin = RELAY4_PIN; break;
+    case 5: pin = RELAY5_PIN; break;
+  }
+
+  // Active HIGH relay module (TRUE/HIGH = ON)
+  digitalWrite(pin, state ? HIGH : LOW);
+
+  Serial.print("Relay ");
+  Serial.print(relayNum);
+  Serial.print(" set to ");
+  Serial.println(state ? "ON" : "OFF");
+}
+
+void handleRoot() {
+  String html = String(HTML_PART1) + String(HTML_PART2);
+  server.send(200, "text/html", html);
+}
+
+void handleGetData() {
+  StaticJsonDocument<512> doc;
+
+  doc["temperature"] = sensorData.temperature;
+  doc["humidity"] = sensorData.humidity;
+  doc["lightLevel"] = sensorData.lightLevel;
+  doc["isAutoMode"] = isAutoMode;
+
+  JsonArray relays = doc.createNestedArray("relays");
+  for (int i = 0; i < 5; i++) {
+    relays.add(relayStates[i]);
+  }
+
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleRelayControl() {
+  if (server.hasArg("id") && server.hasArg("action")) {
+    int relayId = server.arg("id").toInt();
+    String action = server.arg("action");
+
+    if (relayId >= 1 && relayId <= 5) {
+      if (!isAutoMode || relayId > 3) {
+        bool newState = !relayStates[relayId - 1];
+        setRelay(relayId, newState);
+
+        StaticJsonDocument<64> doc;
+        doc["state"] = relayStates[relayId - 1];
+        doc["relay"] = relayId;
+
+        String json;
+        serializeJson(doc, json);
+        server.send(200, "application/json", json);
+        return;
+      }
+    }
+  }
+
+  server.send(400, "application/json", "{\"error\":\"Invalid request\"}");
+}
+
+void handleModeChange() {
+  if (server.hasArg("mode")) {
+    String mode = server.arg("mode");
+    isAutoMode = (mode == "auto");
+
+    StaticJsonDocument<64> doc;
+    doc["isAutoMode"] = isAutoMode;
+    doc["mode"] = mode;
+
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
+
+    Serial.print("Mode changed to: ");
+    Serial.println(mode);
+  } else {
+    server.send(400, "application/json", "{\"error\":\"Missing mode\"}");
+  }
+}
+
+void handleGetSettings() {
+  StaticJsonDocument<256> doc;
+
+  doc["tempMin"] = settings.tempMin;
+  doc["tempMax"] = settings.tempMax;
+  doc["humidMin"] = settings.humidMin;
+  doc["humidMax"] = settings.humidMax;
+  doc["lightThresh"] = settings.lightThresh;
+
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+void handleSaveSettings() {
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+    if (!error) {
+      settings.tempMin = doc["tempMin"];
+      settings.tempMax = doc["tempMax"];
+      settings.humidMin = doc["humidMin"];
+      settings.humidMax = doc["humidMax"];
+      settings.lightThresh = doc["lightThresh"];
+
+      Serial.println("Settings updated:");
+      Serial.print("Temp: ");
+      Serial.print(settings.tempMin);
+      Serial.print(" - ");
+      Serial.println(settings.tempMax);
+
+      server.send(200, "application/json", "{\"success\":true}");
+    } else {
+      server.send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+    }
+  } else {
+    server.send(400, "application/json", "{\"error\":\"No data\"}");
+  }
+}
